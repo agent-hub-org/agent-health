@@ -6,7 +6,7 @@ from a2a.server.request_handlers import DefaultRequestHandler
 from agent_sdk.a2a.server.mongodb_task_store import AsyncMongoDBTaskStore
 
 from .agent_card import HEALTH_AGENT_CARD
-from .executor import HealthExecutor
+from .executor import HealthAgentExecutor
 
 logger = logging.getLogger("agent_health.a2a_server")
 
@@ -19,7 +19,7 @@ def create_a2a_app() -> A2AStarletteApplication:
         db_name=os.getenv("MONGO_DB_NAME", "agent_health"),
         collection_name="a2a_tasks",
     )
-    executor = HealthExecutor()
+    executor = HealthAgentExecutor()
     request_handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=task_store,
