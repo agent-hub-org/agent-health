@@ -2,9 +2,8 @@ import asyncio
 import json
 import logging
 import os
-import re
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
@@ -15,28 +14,15 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+from agent_sdk.logging import configure_logging
+from agent_sdk.context import request_id_var, user_id_var
+from agent_sdk.metrics import metrics_response
 from agents.agent import create_agent, run_query, create_stream, save_memory, _fix_flash_card_format
+from agent_sdk.database.memory import _get_client as _get_mem0_client
 from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
 
-
-class _JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        doc = {
-            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "msg": record.getMessage(),
-        }
-        if record.exc_info:
-            doc["exc"] = self.formatException(record.exc_info)
-        return json.dumps(doc, ensure_ascii=False)
-
-
-_handler = logging.StreamHandler()
-_handler.setFormatter(_JsonFormatter())
-logging.root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
-logging.root.addHandler(_handler)
+configure_logging("agent_health")
 logger = logging.getLogger("agent_health.api")
 limiter = Limiter(key_func=get_remote_address)
 
@@ -68,12 +54,26 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Internal-API-Key", "X-User-Id", "X-Request-ID"],
 )
+
+_PUBLIC_PATHS = {"/health", "/metrics", "/docs", "/openapi.json", "/a2a/.well-known/agent.json"}
+
+@app.middleware("http")
+async def inject_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    tok_r = request_id_var.set(request_id)
+    tok_u = user_id_var.set(request.headers.get("X-User-Id"))
+    response = await call_next(request)
+    request_id_var.reset(tok_r)
+    user_id_var.reset(tok_u)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 @app.middleware("http")
 async def verify_internal_key(request: Request, call_next):
-    if request.url.path not in ["/health", "/docs", "/openapi.json", "/a2a/.well-known/agent.json"]:
+    if request.url.path not in _PUBLIC_PATHS:
         expected = os.getenv("INTERNAL_API_KEY")
         if expected and request.headers.get("X-Internal-API-Key") != expected:
             return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"detail": "Unauthorized internal access"})
@@ -209,6 +209,8 @@ async def ask_stream(body: AskRequest, request: Request):
         user_id=user_id,
     )
 
+    _STREAM_TIMEOUT = float(os.getenv("STREAM_TIMEOUT_SECONDS", "300"))
+
     async def event_stream():
         try:
             full_response: list[str] = []
@@ -216,9 +218,13 @@ async def ask_stream(body: AskRequest, request: Request):
 
             async def _stream_producer():
                 try:
-                    async for chunk in stream:
-                        await queue.put(("chunk", chunk))
+                    async with asyncio.timeout(_STREAM_TIMEOUT):
+                        async for chunk in stream:
+                            await queue.put(("chunk", chunk))
                     await queue.put(("done", None))
+                except TimeoutError:
+                    logger.error("Stream producer timed out after %.0fs", _STREAM_TIMEOUT)
+                    await queue.put(("error", f"Response timed out after {_STREAM_TIMEOUT:.0f}s."))
                 except Exception as exc:
                     logger.error("Stream producer failed: %s", exc)
                     await queue.put(("error", str(exc)))
@@ -304,11 +310,7 @@ async def get_history(session_id: str):
 @app.post("/profile", response_model=HealthProfileResponse, status_code=status.HTTP_200_OK)
 @limiter.limit("20/minute")
 async def save_profile(body: HealthProfileRequest, request: Request):
-    """Create or update a user's health profile.
-
-    Requires the X-User-Id header to identify the user. The profile is automatically
-    injected into every subsequent /ask request for that user.
-    """
+    """Create or update a user's health profile."""
     user_id = request.headers.get("X-User-Id") or None
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="X-User-Id header is required to save a health profile.")
@@ -322,10 +324,7 @@ async def save_profile(body: HealthProfileRequest, request: Request):
 
 @app.get("/profile", response_model=HealthProfileResponse)
 async def get_profile(request: Request):
-    """Retrieve a user's stored health profile.
-
-    Requires the X-User-Id header.
-    """
+    """Retrieve a user's stored health profile."""
     user_id = request.headers.get("X-User-Id") or None
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="X-User-Id header is required.")
@@ -380,7 +379,7 @@ async def export_plan(session_id: str):
 
 @app.get("/download/{file_id}")
 async def download_file(file_id: str):
-    """Download any generated file by its file_id (from generate_fitness_plan tool output)."""
+    """Download any generated file by its file_id."""
     result = await MongoDB.retrieve_file(file_id)
     if not result:
         raise HTTPException(status_code=404, detail="File not found.")
@@ -400,6 +399,12 @@ async def download_file(file_id: str):
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/metrics")
+async def metrics():
+    content, content_type = metrics_response()
+    return Response(content=content, media_type=content_type)
 
 
 @app.get("/health")
