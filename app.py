@@ -17,7 +17,7 @@ from slowapi.util import get_remote_address
 from agent_sdk.logging import configure_logging
 from agent_sdk.context import request_id_var, user_id_var
 from agent_sdk.metrics import metrics_response
-from agents.agent import create_agent, run_query, create_stream, save_memory, _fix_flash_card_format
+from agents.agent import create_agent, run_query, create_stream, save_memory
 from agent_sdk.database.memory import _get_client as _get_mem0_client
 from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
@@ -276,9 +276,6 @@ async def ask_stream(body: AskRequest, request: Request):
                 fallback = "Sorry, the model returned an empty response. Please try again or switch to a different model."
                 yield f"data: {json.dumps({'text': fallback})}\n\n"
                 response_text = fallback
-
-            if body.response_format == "flash_cards":
-                response_text = _fix_flash_card_format(response_text)
 
             try:
                 save_memory(user_id=user_id or session_id, query=body.query, response=response_text)
