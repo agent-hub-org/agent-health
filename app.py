@@ -223,52 +223,45 @@ async def ask_stream(body: AskRequest, request: Request):
     _STREAM_TIMEOUT = float(os.getenv("STREAM_TIMEOUT_SECONDS", "300"))
 
     async def event_stream():
+        full_response: list[str] = []
+        last_heartbeat = asyncio.get_event_loop().time()
+
         try:
-            full_response: list[str] = []
-            queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
-
-            async def _stream_producer():
-                try:
-                    async with asyncio.timeout(_STREAM_TIMEOUT):
-                        async for chunk in stream:
-                            await queue.put(("chunk", chunk))
-                    await queue.put(("done", None))
-                except TimeoutError:
-                    logger.error("Stream producer timed out after %.0fs", _STREAM_TIMEOUT)
-                    await queue.put(("error", f"Response timed out after {_STREAM_TIMEOUT:.0f}s."))
-                except Exception as exc:
-                    logger.error("Stream producer failed: %s", exc)
-                    await queue.put(("error", str(exc)))
-
-            async def _keepalive_producer():
-                while True:
-                    await asyncio.sleep(15)
-                    await queue.put(("keepalive", None))
-
-            producer_task = asyncio.create_task(_stream_producer())
-            keepalive_task = asyncio.create_task(_keepalive_producer())
-
             try:
-                while True:
-                    kind, data = await queue.get()
-                    if kind == "chunk":
-                        full_response.append(data)
-                        yield f"data: {json.dumps({'text': data})}\n\n"
-                    elif kind == "keepalive":
-                        yield ": keep-alive\n\n"
-                    elif kind == "error":
-                        error_msg = "An error occurred processing your request. Please try again or switch to a different model."
-                        yield f"data: {json.dumps({'text': error_msg})}\n\n"
-                        break
-                    elif kind == "done":
-                        break
-            finally:
-                keepalive_task.cancel()
-                try:
-                    await keepalive_task
-                except asyncio.CancelledError:
-                    pass
-                await producer_task
+                async with asyncio.timeout(_STREAM_TIMEOUT):
+                    # Use a wrapper to handle heartbeats if the stream is slow
+                    async def wrapped_stream():
+                        nonlocal last_heartbeat
+                        async for chunk in stream:
+                            now = asyncio.get_event_loop().time()
+                            if now - last_heartbeat > 15:
+                                yield f": heartbeat {int(now)}\n\n"
+                                last_heartbeat = now
+                            yield chunk
+
+                    async for chunk in wrapped_stream():
+                        if chunk.startswith(": heartbeat"):
+                            yield f"{chunk}"
+                        elif isinstance(chunk, str) and chunk.startswith("__PROGRESS__:"):
+                            phase_label = chunk[len("__PROGRESS__:"):]
+                            yield f"event: progress\ndata: {json.dumps({'phase': phase_label})}\n\n"
+                        else:
+                            full_response.append(chunk)
+                            yield f"data: {json.dumps({'text': chunk})}\n\n"
+            except TimeoutError:
+                logger.error("Stream producer timed out after %.0fs", _STREAM_TIMEOUT)
+                error_msg = f"Response timed out after {_STREAM_TIMEOUT:.0f} seconds. Please try a simpler query."
+                yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
+                fallback = f"\n\n[{error_msg}]"
+                yield f"data: {json.dumps({'text': fallback})}\n\n"
+                full_response.append(fallback)
+            except Exception as exc:
+                logger.error("Stream producer failed: %s", exc)
+                error_msg = "An internal error occurred while generating the response."
+                yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
+                fallback = f"\n\n[{error_msg}]"
+                yield f"data: {json.dumps({'text': fallback})}\n\n"
+                full_response.append(fallback)
 
             response_text = "".join(full_response)
 
