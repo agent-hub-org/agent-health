@@ -225,67 +225,77 @@ async def ask_stream(body: AskRequest, request: Request):
 
     async def event_stream():
         full_response: list[str] = []
-        last_heartbeat = asyncio.get_event_loop().time()
+        queue = asyncio.Queue()
+        _PROGRESS_PREFIX = "__PROGRESS__:"
+        _HEARTBEAT_INTERVAL = 15.0
 
-        try:
+        async def heartbeat_worker():
+            try:
+                while True:
+                    await asyncio.sleep(_HEARTBEAT_INTERVAL)
+                    await queue.put(f": heartbeat {int(asyncio.get_event_loop().time())}\n\n")
+            except asyncio.CancelledError:
+                pass
+
+        async def agent_worker():
             try:
                 async with asyncio.timeout(_STREAM_TIMEOUT):
-                    # Use a wrapper to handle heartbeats if the stream is slow
-                    async def wrapped_stream():
-                        nonlocal last_heartbeat
-                        async for chunk in stream:
-                            now = asyncio.get_event_loop().time()
-                            if now - last_heartbeat > 15:
-                                yield f": heartbeat {int(now)}\n\n"
-                                last_heartbeat = now
-                            yield chunk
-
-                    async for chunk in wrapped_stream():
-                        if chunk.startswith(": heartbeat"):
-                            yield f"{chunk}"
-                        elif isinstance(chunk, str) and chunk.startswith("__PROGRESS__:"):
-                            phase_label = chunk[len("__PROGRESS__:"):]
-                            yield f"event: progress\ndata: {json.dumps({'phase': phase_label})}\n\n"
-                        else:
-                            full_response.append(chunk)
-                            yield f"data: {json.dumps({'text': chunk})}\n\n"
+                    async for chunk in stream:
+                        await queue.put(chunk)
             except TimeoutError:
                 logger.error("Stream producer timed out after %.0fs", _STREAM_TIMEOUT)
-                error_msg = f"Response timed out after {_STREAM_TIMEOUT:.0f} seconds. Please try a simpler query."
-                yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
-                fallback = f"\n\n[{error_msg}]"
-                yield f"data: {json.dumps({'text': fallback})}\n\n"
-                full_response.append(fallback)
+                await queue.put(f"__ERROR__:Response timed out after {_STREAM_TIMEOUT:.0f} seconds.")
             except Exception as exc:
                 logger.error("Stream producer failed: %s", exc)
-                error_msg = "An internal error occurred while generating the response."
-                yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
-                fallback = f"\n\n[{error_msg}]"
-                yield f"data: {json.dumps({'text': fallback})}\n\n"
-                full_response.append(fallback)
+                await queue.put("__ERROR__:An internal error occurred while generating the response.")
+            finally:
+                await queue.put(None)
+
+        heartbeat_task = asyncio.create_task(heartbeat_worker())
+        agent_task = asyncio.create_task(agent_worker())
+
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+
+                if isinstance(chunk, str):
+                    if chunk.startswith(": heartbeat"):
+                        yield chunk
+                    elif chunk.startswith(_PROGRESS_PREFIX):
+                        phase_label = chunk[len(_PROGRESS_PREFIX):]
+                        yield f"event: progress\ndata: {json.dumps({'phase': phase_label})}\n\n"
+                    elif chunk.startswith("__ERROR__:"):
+                        error_msg = chunk[len("__ERROR__:"):]
+                        yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
+                        fallback = f"\n\n[{error_msg}]"
+                        yield f"data: {json.dumps({'text': fallback})}\n\n"
+                        full_response.append(fallback)
+                    else:
+                        full_response.append(chunk)
+                        yield f"data: {json.dumps({'text': chunk})}\n\n"
 
             response_text = "".join(full_response)
-
             if not response_text.strip():
-                fallback = "Sorry, the model returned an empty response. Please try again or switch to a different model."
+                fallback = "Sorry, the model returned an empty response. Please try again."
                 yield f"data: {json.dumps({'text': fallback})}\n\n"
                 response_text = fallback
 
             try:
                 save_memory(user_id=user_id or session_id, query=body.query, response=response_text)
                 await MongoDB.save_conversation(
-                    session_id=session_id,
-                    query=body.query,
-                    response=response_text,
+                    session_id=session_id, query=body.query, response=response_text,
                     steps=stream.steps if hasattr(stream, "steps") else [],
-                    user_id=user_id,
-                    plan=stream.plan if hasattr(stream, "plan") else None,
+                    user_id=user_id, plan=stream.plan if hasattr(stream, "plan") else None,
                 )
             except Exception as e:
-                logger.error("Failed to save memory/conversation: %s", e)
+                logger.error("Failed to save conversation: %s", e)
 
             yield f"data: {json.dumps({'session_id': session_id})}\n\n"
         finally:
+            heartbeat_task.cancel()
+            await agent_task
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
