@@ -445,6 +445,94 @@ async def download_file(file_id: str):
     )
 
 
+# ── Progress & Nutrition endpoints ──
+
+class ProgressLogRequest(BaseModel):
+    metric_type: str
+    value: float
+    unit: str
+    notes: str = ""
+    date: str | None = None
+
+
+@app.post("/progress")
+@limiter.limit("60/minute")
+async def log_progress(body: ProgressLogRequest, request: Request):
+    """Log a fitness or health measurement."""
+    user_id = request.headers.get("X-User-Id") or None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    from datetime import timezone as _tz
+    date = body.date or datetime.now(_tz.utc).strftime("%Y-%m-%d")
+    await MongoDB.log_progress(
+        user_id=user_id,
+        metric_type=body.metric_type,
+        value=body.value,
+        unit=body.unit,
+        notes=body.notes,
+        date=date,
+    )
+    return {"success": True, "date": date}
+
+
+@app.get("/progress")
+@limiter.limit("60/minute")
+async def get_progress(request: Request, metric_type: str | None = None, days: int = 30):
+    """Get recent progress logs for the user."""
+    user_id = request.headers.get("X-User-Id") or None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if metric_type:
+        data = await MongoDB.get_progress(user_id=user_id, metric_type=metric_type, days=days)
+    else:
+        data = await MongoDB.get_all_progress(user_id=user_id, days=days)
+    return {"progress": data, "days": days}
+
+
+class NutritionLogRequest(BaseModel):
+    meal_description: str
+    calories_kcal: float
+    protein_g: float = 0.0
+    carbs_g: float = 0.0
+    fat_g: float = 0.0
+    meal_type: str = "meal"
+    date: str | None = None
+
+
+@app.post("/nutrition")
+@limiter.limit("60/minute")
+async def log_nutrition(body: NutritionLogRequest, request: Request):
+    """Log a meal or nutrition entry."""
+    user_id = request.headers.get("X-User-Id") or None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    from datetime import timezone as _tz
+    date = body.date or datetime.now(_tz.utc).strftime("%Y-%m-%d")
+    await MongoDB.log_nutrition(
+        user_id=user_id,
+        meal_description=body.meal_description,
+        calories_kcal=body.calories_kcal,
+        protein_g=body.protein_g,
+        carbs_g=body.carbs_g,
+        fat_g=body.fat_g,
+        meal_type=body.meal_type,
+        date=date,
+    )
+    daily = await MongoDB.get_daily_nutrition_total(user_id=user_id, date=date)
+    return {"success": True, "date": date, "daily_total": daily}
+
+
+@app.get("/nutrition")
+@limiter.limit("60/minute")
+async def get_nutrition(request: Request, days: int = 7):
+    """Get recent nutrition logs for the user."""
+    user_id = request.headers.get("X-User-Id") or None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    logs = await MongoDB.get_nutrition_logs(user_id=user_id, days=days)
+    return {"logs": logs, "days": days}
+
+
 @app.get("/metrics")
 async def metrics():
     content, content_type = metrics_response()

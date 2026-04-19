@@ -128,6 +128,111 @@ class MongoDB(BaseMongoDatabase):
             sort=[("created_at", -1)],
         )
 
+    # ── Progress tracking ──
+
+    @classmethod
+    def _progress(cls):
+        return cls._db()["progress_logs"]
+
+    @classmethod
+    def _nutrition(cls):
+        return cls._db()["nutrition_logs"]
+
+    @classmethod
+    async def log_progress(
+        cls,
+        user_id: str,
+        metric_type: str,
+        value: float,
+        unit: str,
+        notes: str = "",
+        date: str = "",
+    ) -> None:
+        from datetime import timezone
+        doc = {
+            "user_id": user_id,
+            "metric_type": metric_type,
+            "value": value,
+            "unit": unit,
+            "notes": notes,
+            "date": date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "created_at": datetime.now(timezone.utc),
+        }
+        await cls._progress().insert_one(doc)
+
+    @classmethod
+    async def get_progress(cls, user_id: str, metric_type: str, days: int = 30) -> list[dict]:
+        from datetime import timedelta, timezone
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        cursor = cls._progress().find(
+            {"user_id": user_id, "metric_type": metric_type, "date": {"$gte": cutoff}},
+            {"_id": 0, "value": 1, "unit": 1, "date": 1, "notes": 1},
+        ).sort("date", 1)
+        return await cursor.to_list(length=500)
+
+    @classmethod
+    async def get_all_progress(cls, user_id: str, days: int = 30) -> list[dict]:
+        from datetime import timedelta, timezone
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        cursor = cls._progress().find(
+            {"user_id": user_id, "date": {"$gte": cutoff}},
+            {"_id": 0},
+        ).sort("date", 1)
+        return await cursor.to_list(length=1000)
+
+    @classmethod
+    async def log_nutrition(
+        cls,
+        user_id: str,
+        meal_description: str,
+        calories_kcal: float,
+        protein_g: float = 0.0,
+        carbs_g: float = 0.0,
+        fat_g: float = 0.0,
+        meal_type: str = "meal",
+        date: str = "",
+    ) -> None:
+        from datetime import timezone
+        doc = {
+            "user_id": user_id,
+            "meal_description": meal_description[:200],
+            "calories_kcal": calories_kcal,
+            "protein_g": protein_g,
+            "carbs_g": carbs_g,
+            "fat_g": fat_g,
+            "meal_type": meal_type,
+            "date": date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "created_at": datetime.now(timezone.utc),
+        }
+        await cls._nutrition().insert_one(doc)
+
+    @classmethod
+    async def get_daily_nutrition_total(cls, user_id: str, date: str) -> dict:
+        pipeline = [
+            {"$match": {"user_id": user_id, "date": date}},
+            {"$group": {
+                "_id": None,
+                "calories_kcal": {"$sum": "$calories_kcal"},
+                "protein_g": {"$sum": "$protein_g"},
+                "carbs_g": {"$sum": "$carbs_g"},
+                "fat_g": {"$sum": "$fat_g"},
+            }},
+        ]
+        result = await cls._nutrition().aggregate(pipeline).to_list(length=1)
+        if result:
+            return {k: round(v, 1) for k, v in result[0].items() if k != "_id"}
+        return {"calories_kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0}
+
+    @classmethod
+    async def get_nutrition_logs(cls, user_id: str, days: int = 7) -> list[dict]:
+        from datetime import timedelta, timezone
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        cursor = cls._nutrition().find(
+            {"user_id": user_id, "date": {"$gte": cutoff}},
+            {"_id": 0},
+        ).sort("date", -1)
+        return await cursor.to_list(length=500)
+
     @classmethod
     async def ensure_indexes(cls) -> None:
         await super().ensure_indexes()
@@ -136,3 +241,7 @@ class MongoDB(BaseMongoDatabase):
         await db["health_profiles"].create_index("updated_at", expireAfterSeconds=31_536_000)
         await db["files"].create_index("created_at", expireAfterSeconds=2_592_000)
         await db["fs.files"].create_index("uploadDate", expireAfterSeconds=2_592_000)
+        await db["progress_logs"].create_index([("user_id", 1), ("metric_type", 1), ("date", 1)])
+        await db["progress_logs"].create_index("created_at", expireAfterSeconds=31_536_000)
+        await db["nutrition_logs"].create_index([("user_id", 1), ("date", 1)])
+        await db["nutrition_logs"].create_index("created_at", expireAfterSeconds=31_536_000)

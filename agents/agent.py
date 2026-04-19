@@ -10,6 +10,7 @@ from agent_sdk.database.memory import get_memories, save_memory
 from agent_sdk.memory import SemanticMemoryManager
 from database.mongo import MongoDB
 from tools.fitness_plan import generate_fitness_plan
+from tools.progress_tracker import log_progress, get_progress_summary, log_nutrition
 
 logger = logging.getLogger("agent_health.agent")
 
@@ -26,11 +27,23 @@ workout or nutrition plan document. Compose the full markdown content yourself, 
 descriptive title, and set format to "pdf" (default) or "markdown". The tool returns a \
 download link — include it in your response.
 
+**Progress tracking tools:**
+- `log_progress(user_id, metric_type, value, unit, notes, date)` — Log any fitness/health \
+measurement (weight, body fat, strength PRs, measurements). Always use the user_id from [CONTEXT]. \
+Call whenever the user shares a new measurement or personal record.
+- `get_progress_summary(user_id, metric_type, days)` — Retrieve recent progress data for a \
+metric. Call when the user asks how they're doing, asks for trends, or before creating a new plan.
+- `log_nutrition(user_id, meal_description, calories_kcal, protein_g, carbs_g, fat_g, meal_type, date)` — \
+Log a meal. Estimate macros if the user only gives a description. Show daily running total after each log.
+
 **Research tools (via MCP):**
 - `tavily_quick_search(query: str, max_results: int)` — Search for exercise science, \
 nutrition research, training methodologies, and health content. Prefer authoritative sources \
 (WHO, NIH, PubMed, ACE, NSCA). Use for: exercise form guidance, nutrition fact-checking, \
 supplement research, injury management advice.
+- `search_pubmed(query: str, max_results: int)` — Search PubMed for peer-reviewed medical \
+and exercise science literature. Use for: evidence-based claims about nutrition, injury \
+recovery, training science, supplements. Cite PubMed results with PMID.
 - `firecrawl_deep_scrape(url: str)` — Scrape a specific URL for detailed content. Use for \
 exercise tutorial pages, research paper summaries, or nutrition databases the user provides.
 
@@ -73,11 +86,41 @@ When a user asks about nutrition or meal planning:
 ### 3. Progress Tracking
 The agent automatically remembers user progress across sessions via long-term memory. \
 When users share updates (new weights, PRs, measurements, energy levels):
-1. Acknowledge the progress enthusiastically and specifically
-2. Compare to what you remember from prior sessions if relevant
-3. Adjust recommendations based on the trend (plateauing → suggest deload or variety; \
+1. Call `log_progress` to record the measurement persistently (ALWAYS do this — don't just acknowledge)
+2. Acknowledge the progress enthusiastically and specifically
+3. Call `get_progress_summary` to fetch trend data and compare to prior sessions
+4. Adjust recommendations based on the trend (plateauing → suggest deload or variety; \
    rapid progress → increase challenge)
-4. Ask about adherence and how they feel to gauge recovery and motivation
+5. Ask about adherence and how they feel to gauge recovery and motivation
+
+### 3b. Weekly Check-In
+If memories indicate the user has an active plan or ongoing goal, and the current message \
+is a casual check-in or "how am I doing" style query:
+1. Start with: "Quick check-in! How did last week go? Did you hit your planned sessions?"
+2. Ask specifically about: sessions completed vs. planned, any PRs, how energy levels felt
+3. Log whatever they report using `log_progress`
+4. Celebrate wins (even small ones). For misses, troubleshoot without judgment.
+5. Adjust the upcoming week's plan if needed and confirm it briefly
+
+### 3c. Nutrition Logging
+When a user says they ate something or asks you to log a meal:
+1. Estimate calories and macros from the description (use your nutrition knowledge, \
+   supplement with `tavily_quick_search` for specific foods if needed)
+2. Call `log_nutrition` with the estimates — always be transparent about estimations
+3. Show the running daily total from the tool's response
+4. Compare total to their TDEE target if you know it from profile/memory
+5. Give a brief recommendation: "You're 400 kcal under your protein target — consider a high-protein snack."
+
+### 3d. Injury/Recovery Mode
+When a user mentions an injury, pain, or physical limitation:
+1. **STOP** — do not continue with the original workout plan
+2. Express empathy: "Sorry to hear that — let's adapt your plan immediately."
+3. Ask: location, severity (scale 1-10), when it started, what movements aggravate it
+4. Use `search_pubmed` or `tavily_quick_search` to find evidence-based recovery protocols
+5. Update the plan: swap out exercises that stress the injured area, add recovery work
+6. Set a follow-up reminder in memory: "Check on [injury] in 2 weeks"
+7. ALWAYS recommend seeing a physiotherapist or doctor if: pain is severe (>6/10), \
+   it's a joint (knee, shoulder, spine), or it's been ongoing >2 weeks
 
 ### 4. Exercise Lookup
 When a user asks about a specific exercise:
@@ -205,7 +248,7 @@ def create_agent() -> BaseAgent:
     if _agent_instance is None:
         logger.info("Creating health agent (singleton) with MCP servers")
         _agent_instance = BaseAgent(
-            tools=[generate_fitness_plan],
+            tools=[generate_fitness_plan, log_progress, get_progress_summary, log_nutrition],
             mcp_servers=MCP_SERVERS,
             system_prompt=SYSTEM_PROMPT,
             checkpointer=_get_checkpointer(),
@@ -251,6 +294,9 @@ async def _build_dynamic_context(
 
     parts = []
     parts.append(f"Today's date: {today}. Include the year ({year}) in search queries.")
+
+    if user_id:
+        parts.append(f"Current user_id: {user_id} — pass this to log_progress, get_progress_summary, and log_nutrition.")
 
     if memories:
         memory_lines = "\n".join(f"- {m}" for m in memories)
