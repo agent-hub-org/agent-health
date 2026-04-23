@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -63,7 +64,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Internal-API-Key", "X-User-Id", "X-Request-ID"],
 )
 
@@ -361,7 +362,7 @@ class SessionsHistoryRequest(BaseModel):
 @limiter.limit("30/minute")
 async def get_history_by_sessions(request: Request, body: SessionsHistoryRequest):
     user_id = request.headers.get("X-User-Id") or None
-    safe_ids = [s for s in body.session_ids[:20] if isinstance(s, str) and s.isalnum() and len(s) <= 64]
+    safe_ids = [s for s in body.session_ids[:20] if isinstance(s, str) and re.match(r'^[a-zA-Z0-9\-]{1,64}$', s)]
     logger.info("POST /history/sessions — %d session(s)", len(safe_ids))
     history = await MongoDB.get_history_by_sessions(safe_ids, user_id=user_id)
     return {"history": history}
@@ -382,6 +383,13 @@ async def save_profile(body: HealthProfileRequest, request: Request):
     logger.info("POST /profile — user='%s', goals='%s'", user_id, body.goals[:80] if body.goals else "")
 
     return HealthProfileResponse(user_id=user_id, **profile_data)
+
+
+@app.put("/profile", response_model=HealthProfileResponse, status_code=status.HTTP_200_OK)
+@limiter.limit("20/minute")
+async def update_profile(body: HealthProfileRequest, request: Request):
+    """Alias for POST /profile — accepts PUT from the marketplace proxy."""
+    return await save_profile(body, request)
 
 
 @app.get("/profile", response_model=HealthProfileResponse)
