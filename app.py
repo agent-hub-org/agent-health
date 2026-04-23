@@ -33,8 +33,14 @@ async def lifespan(app: FastAPI):
     if not os.getenv("INTERNAL_API_KEY"):
         logger.warning("INTERNAL_API_KEY is not set — internal API is unprotected. Set this in production.")
     agent = create_agent()
-    await agent._ensure_initialized()
-    logger.info("MCP servers connected, health agent ready")
+    try:
+        await agent._ensure_initialized()
+        if getattr(agent, '_degraded', False):
+            logger.warning("Agent started in DEGRADED mode — MCP tools unavailable")
+        else:
+            logger.info("MCP servers connected, health agent ready")
+    except Exception as e:
+        logger.error("Agent initialization failed (continuing without MCP): %s", e)
     await MongoDB.ensure_indexes()
     yield
     await agent._disconnect_mcp()
@@ -241,7 +247,7 @@ async def ask_stream(body: AskRequest, request: Request):
 
     async def event_stream():
         full_response: list[str] = []
-        queue = asyncio.Queue()
+        queue = asyncio.Queue(maxsize=100)
         _PROGRESS_PREFIX = "__PROGRESS__:"
         _HEARTBEAT_INTERVAL = 15.0
 
@@ -257,7 +263,11 @@ async def ask_stream(body: AskRequest, request: Request):
             try:
                 async with asyncio.timeout(_STREAM_TIMEOUT):
                     async for chunk in stream:
-                        await queue.put(chunk)
+                        try:
+                            await asyncio.wait_for(queue.put(chunk), timeout=30.0)
+                        except asyncio.TimeoutError:
+                            logger.warning("Stream queue full for session='%s' — client likely disconnected", session_id)
+                            return
             except TimeoutError:
                 logger.error("Stream producer timed out after %.0fs", _STREAM_TIMEOUT)
                 await queue.put(f"__ERROR__:Response timed out after {_STREAM_TIMEOUT:.0f} seconds.")
@@ -265,7 +275,10 @@ async def ask_stream(body: AskRequest, request: Request):
                 logger.error("Stream producer failed: %s", exc)
                 await queue.put("__ERROR__:An internal error occurred while generating the response.")
             finally:
-                await queue.put(None)
+                try:
+                    queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
 
         heartbeat_task = asyncio.create_task(heartbeat_worker())
         agent_task = asyncio.create_task(agent_worker())
@@ -311,7 +324,11 @@ async def ask_stream(body: AskRequest, request: Request):
             yield f"data: {json.dumps({'session_id': session_id})}\n\n"
         finally:
             heartbeat_task.cancel()
-            await agent_task
+            agent_task.cancel()
+            try:
+                await agent_task
+            except asyncio.CancelledError:
+                pass
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
