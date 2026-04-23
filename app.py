@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -248,7 +249,7 @@ async def ask_stream(body: AskRequest, request: Request):
             try:
                 while True:
                     await asyncio.sleep(_HEARTBEAT_INTERVAL)
-                    await queue.put(f": heartbeat {int(asyncio.get_event_loop().time())}\n\n")
+                    await queue.put(f": heartbeat {int(asyncio.get_running_loop().time())}\n\n")
             except asyncio.CancelledError:
                 pass
 
