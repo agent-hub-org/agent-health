@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timezone
 
 from motor.motor_asyncio import AsyncIOMotorGridFSBucket
-from agent_sdk.database.mongo import BaseMongoDatabase
+from agent_common.database.mongo import BaseMongoDatabase
 
 logger = logging.getLogger("agent_health.mongo")
 

@@ -1,7 +1,7 @@
 import logging
 
 from agent_sdk.a2a.executor import StreamingAgentExecutor
-from agents.agent import run_query, stream_for_a2a
+from agents.runner import run_query, stream_for_a2a
 
 logger = logging.getLogger("agent_health.a2a_executor")
 
